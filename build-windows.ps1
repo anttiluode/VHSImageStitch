@@ -15,8 +15,8 @@ function Check-Exit([string]$label) {
     }
 }
 
-if (-not (Test-Path "SweepAtlasSigh.txt")) {
-    throw "Cannot find SweepAtlasSigh.txt in this repository."
+if (-not (Test-Path "SweepAtlasSigh.py") -and -not (Test-Path "SweepAtlasSigh.txt")) {
+    throw "Cannot find SweepAtlasSigh.py or SweepAtlasSigh.txt in this repository."
 }
 if (-not (Test-Path "vhsimagestitch_launcher.py")) {
     throw "Cannot find vhsimagestitch_launcher.py."
@@ -31,9 +31,10 @@ if (-not $SkipInstall) {
     Check-Exit "Install build dependencies"
 }
 
-# The published repository uses .txt for the original Python script.
-# Copy (don't rename or overwrite) it into the importable .py module.
-Copy-Item -LiteralPath "SweepAtlasSigh.txt" -Destination "SweepAtlasSigh.py" -Force
+# Prefer the normal .py source. Accept older checkouts with only the .txt file.
+if (-not (Test-Path "SweepAtlasSigh.py")) {
+    Copy-Item -LiteralPath "SweepAtlasSigh.txt" -Destination "SweepAtlasSigh.py" -Force
+}
 
 python -m py_compile "SweepAtlasSigh.py" "vhsimagestitch_launcher.py"
 Check-Exit "Python syntax check"
