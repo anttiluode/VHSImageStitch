@@ -1,0 +1,1780 @@
+#!/usr/bin/env python3
+"""SweepAtlasSigh - Super-Resolution Webcam & Video Stitcher using Sigh Sub-Frequency Moire Carrier.
+
+Pipeline:
+  (a) Optional interactive input crop (draw box on left view to exclude VHS date stamps / overscan noise),
+      then transform cropped frame into its EQ'd sub-frequency Moire pattern (Sigh field).
+  (b) Fit images together to sub-pixel precision using phase correlation + Moire carrier
+      extrema (Euclidean/Similarity/Affine/Homography RANSAC) with strict scale & zoom guards.
+  (c) Super-Resolution Splatting & Iterative Back-Projection (IBP):
+      Project frames onto a scaled (e.g., 2.0x) dense atlas grid using narrow sub-pixel
+      Drizzle weights and high-frequency residual back-projection (Living Paper update).
+
+Run webcam (2x Super-Res default):  python SweepAtlasSigh.py
+Run 3x Super-Res:                   python SweepAtlasSigh.py --super-res 3.0
+Run video:                          python SweepAtlasSigh.py --video path/to/video.mp4
+Self-test (zoom and alignment):      python SweepAtlasSigh_zoomfix.py --self-test
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime
+from functools import lru_cache
+import math
+from pathlib import Path
+import sys
+import time
+
+import cv2
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Geometry & Crop Helpers
+# ---------------------------------------------------------------------------
+
+def transform_points(h: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    return cv2.perspectiveTransform(
+        np.asarray(pts, np.float32).reshape(-1, 1, 2),
+        np.asarray(h, np.float64)
+    ).reshape(-1, 2)
+
+
+def center_of(h: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    w, ht = size
+    return transform_points(h, [(w * 0.5, ht * 0.5)])[0]
+
+
+def apply_normalized_crop(
+    frame: np.ndarray, crop_norm: tuple[float, float, float, float] | None
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Crops frame using normalized (x0, y0, x1, y1) in [0..1], aligned to even pixels."""
+    h, w = frame.shape[:2]
+    if crop_norm is None:
+        return frame, (0, 0, w, h)
+    nx0, ny0, nx1, ny1 = crop_norm
+    x0 = int(round(np.clip(min(nx0, nx1), 0.0, 1.0) * w)) & ~1
+    y0 = int(round(np.clip(min(ny0, ny1), 0.0, 1.0) * h)) & ~1
+    x1 = int(round(np.clip(max(nx0, nx1), 0.0, 1.0) * w)) & ~1
+    y1 = int(round(np.clip(max(ny0, ny1), 0.0, 1.0) * h)) & ~1
+    if x1 - x0 < 48 or y1 - y0 < 48:
+        return frame, (0, 0, w, h)
+    return np.ascontiguousarray(frame[y0:y1, x0:x1]), (x0, y0, x1, y1)
+
+
+# ---------------------------------------------------------------------------
+# Non-Destructive Readout Adjustments (Contrast / Sharpness)
+# ---------------------------------------------------------------------------
+
+MAX_CONTRAST = 200
+MAX_SHARPNESS = 200
+HALO = 12
+
+
+@lru_cache(maxsize=201)
+def _contrast_lut(percent: int) -> np.ndarray:
+    gain = percent / 100.0
+    levels = np.arange(256, dtype=np.float32)
+    return np.clip(np.rint((levels - 127.5) * gain + 127.5), 0, 255).astype(np.uint8)
+
+
+@dataclass
+class ImageAdjustments:
+    contrast: int = 100
+    sharpness: int = 0
+
+    def __post_init__(self):
+        self.contrast = int(np.clip(self.contrast, 0, MAX_CONTRAST))
+        self.sharpness = int(np.clip(self.sharpness, 0, MAX_SHARPNESS))
+
+    @property
+    def active(self) -> bool:
+        return self.contrast != 100 or self.sharpness != 0
+
+    def apply(self, bgr: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+        if not self.active:
+            return bgr
+        result = cv2.LUT(bgr, _contrast_lut(self.contrast)) if self.contrast != 100 else bgr
+        if self.sharpness:
+            amount = self.sharpness / 100.0
+            original = result.astype(np.float32)
+            if mask is not None:
+                valid = (mask != 0).astype(np.float32)
+                smooth_rgb = cv2.GaussianBlur(original * valid[:, :, None], (5, 5), 1.05)
+                smooth_alpha = cv2.GaussianBlur(valid, (5, 5), 1.05)
+                smooth_rgb /= np.maximum(smooth_alpha[:, :, None], 1e-5)
+            else:
+                smooth_rgb = cv2.GaussianBlur(original, (5, 5), 1.05)
+            result = np.clip(np.rint(original + amount * (original - smooth_rgb)), 0, 255).astype(np.uint8)
+        if mask is not None:
+            result = result.copy()
+            result[mask == 0] = bgr[mask == 0]
+        return result
+
+    def apply_rgba_inplace(self, bgra: np.ndarray, stripe_height: int = 256) -> None:
+        if not self.active:
+            return
+        height = bgra.shape[0]
+        previous = None
+        for y0 in range(0, height, stripe_height):
+            y1 = min(height, y0 + stripe_height)
+            current = bgra[y0:min(height, y1 + HALO)].copy()
+            source = np.concatenate((previous, current), axis=0) if previous is not None else current
+            top = len(previous) if previous is not None else 0
+            processed = self.apply(source[:, :, :3], source[:, :, 3])
+            count = min(HALO, y1 - y0)
+            previous = current[(y1 - y0) - count:y1 - y0].copy()
+            bgra[y0:y1, :, :3] = processed[top:top + (y1 - y0)]
+
+
+# ---------------------------------------------------------------------------
+# Step (a): Sigh Sub-Frequency Moire Carrier & EQ Filter
+# ---------------------------------------------------------------------------
+
+class SighMoireEQ:
+    """Computes the 2D radial FFT band-pass Moire pattern and extracts carrier nodes."""
+
+    PRESETS = {
+        "Sub-Moire Peak (Screenshot)": np.array([0.0, 0.05, 0.92, 0.45, 0.02, 0.0, 0.0, 0.0, 0.05, 0.12], dtype=np.float32),
+        "Clean Sigh BandPass": np.array([0.02, 0.35, 0.95, 1.0, 0.65, 0.20, 0.05, 0.01, 0.0, 0.0], dtype=np.float32),
+        "Low-Mid Structural": np.array([0.05, 0.75, 1.0, 0.80, 0.35, 0.10, 0.02, 0.0, 0.0, 0.0], dtype=np.float32),
+        "Wide Carrier": np.array([0.05, 0.4, 0.8, 0.9, 1.0, 0.9, 0.6, 0.3, 0.1, 0.02], dtype=np.float32),
+    }
+
+    def __init__(self, work_size: tuple[int, int] = (256, 144), num_bands: int = 10):
+        self.work_w, self.work_h = work_size
+        self.num_bands = num_bands
+        self.gains = self.PRESETS["Sub-Moire Peak (Screenshot)"].copy()
+        self._build_grids(self.work_w, self.work_h)
+
+    def _build_grids(self, w: int, h: int) -> None:
+        self.work_w, self.work_h = w, h
+        ky = np.fft.fftfreq(h, d=1.0).astype(np.float32)
+        kx = np.fft.fftfreq(w, d=1.0).astype(np.float32)
+        ky_grid, kx_grid = np.meshgrid(ky, kx, indexing="ij")
+        k_mag = np.sqrt(kx_grid ** 2 + ky_grid ** 2) / np.sqrt(0.5 ** 2 + 0.5 ** 2)
+        self.k_norm = np.clip(k_mag ** 0.75, 0.0, 1.0)
+        self.hann = np.outer(np.hanning(h), np.hanning(w)).astype(np.float32)
+        self._update_filter_map()
+
+    def _update_filter_map(self) -> None:
+        band_x = np.linspace(0.0, 1.0, self.num_bands, dtype=np.float32)
+        lut_x = np.linspace(0.0, 1.0, 512, dtype=np.float32)
+        lut_gains = np.interp(lut_x, band_x, self.gains).astype(np.float32)
+        lut_gains[0] = 0.0
+        indices = np.clip((self.k_norm * 511).astype(np.int32), 0, 511)
+        self.filter_2d = lut_gains[indices]
+
+    def set_gains(self, gains: np.ndarray) -> None:
+        self.gains = np.clip(np.asarray(gains, dtype=np.float32), 0.0, 1.0)
+        self._update_filter_map()
+
+    def update_band_from_drag(self, band_idx: int, gain: float) -> None:
+        if 0 <= band_idx < self.num_bands:
+            self.gains[band_idx] = float(np.clip(gain, 0.0, 1.0))
+            self._update_filter_map()
+
+    def transform(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray, list[cv2.KeyPoint], np.ndarray | None]:
+        h, w = frame_bgr.shape[:2]
+        aspect_h = max(64, int(round(self.work_w * (h / max(1, w)) / 8.0) * 8))
+        if (self.work_w, aspect_h) != (self.work_w, self.work_h):
+            self._build_grids(self.work_w, aspect_h)
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (self.work_w, self.work_h), interpolation=cv2.INTER_AREA).astype(np.float32)
+        small = (small - small.mean()) / (small.std() + 1e-6)
+
+        fft2 = np.fft.fft2(small)
+        filtered_fft = fft2 * self.filter_2d
+        moire = np.fft.ifft2(filtered_fft).real.astype(np.float32)
+
+        std = float(moire.std())
+        moire_norm = moire / (3.0 * std) if std > 1e-6 else moire
+        moire_u8 = np.clip((moire_norm + 0.5) * 255.0, 0, 255).astype(np.uint8)
+        moire_u8 = cv2.GaussianBlur(moire_u8, (3, 3), 0.6)
+
+        dilated = cv2.dilate(moire_u8, np.ones((5, 5), np.uint8))
+        eroded = cv2.erode(moire_u8, np.ones((5, 5), np.uint8))
+        peaks = (moire_u8 == dilated) & (moire_u8 > 142)
+        troughs = (moire_u8 == eroded) & (moire_u8 < 113)
+        nodes_mask = peaks | troughs
+
+        margin = 10
+        nodes_mask[:margin, :] = False
+        nodes_mask[-margin:, :] = False
+        nodes_mask[:, :margin] = False
+        nodes_mask[:, -margin:] = False
+
+        ys, xs = np.where(nodes_mask)
+        strengths = np.abs(moire_u8[ys, xs].astype(np.float32) - 127.5)
+        order = np.argsort(-strengths)[:650]
+
+        kps = []
+        for i in order:
+            yi, xi = int(ys[i]), int(xs[i])
+            dx_sub, dy_sub = 0.0, 0.0
+            if 1 <= xi < self.work_w - 1 and 1 <= yi < self.work_h - 1:
+                denom_x = float(moire[yi, xi - 1] - 2.0 * moire[yi, xi] + moire[yi, xi + 1])
+                denom_y = float(moire[yi - 1, xi] - 2.0 * moire[yi, xi] + moire[yi + 1, xi])
+                if abs(denom_x) > 1e-5:
+                    dx_sub = float(np.clip(0.5 * (moire[yi, xi - 1] - moire[yi, xi + 1]) / denom_x, -0.45, 0.45))
+                if abs(denom_y) > 1e-5:
+                    dy_sub = float(np.clip(0.5 * (moire[yi - 1, xi] - moire[yi + 1, xi]) / denom_y, -0.45, 0.45))
+            kps.append(cv2.KeyPoint(float(xi) + dx_sub, float(yi) + dy_sub, 16.0, -1.0, float(strengths[i])))
+
+        orb_desc = cv2.ORB_create(edgeThreshold=8, patchSize=19)
+        if kps:
+            kps, desc = orb_desc.compute(moire_u8, kps)
+        else:
+            desc = None
+
+        return moire_u8, moire * self.hann, kps, desc
+
+
+# ---------------------------------------------------------------------------
+# Step (c): Multi-Frame Super-Resolution (Drizzle + Iterative Back-Projection)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Keyframe:
+    number: int
+    moire_u8: np.ndarray
+    moire_f32: np.ndarray
+    gray_full: np.ndarray
+    keypoints: list
+    descriptors: np.ndarray | None
+    pose: np.ndarray
+    center: np.ndarray
+    rgb_keypoints: list | None = None
+    rgb_descriptors: np.ndarray | None = None
+
+
+@dataclass
+class Match:
+    pose: np.ndarray
+    inliers: int
+    good: int
+    error: float
+    phase_response: float
+    reference: Keyframe
+    method: str = "MOIRE"
+    coverage: float = 0.0
+    zoom: float = 1.0
+
+
+class AtlasTiles:
+    """Super-Resolution Tile Atlas with Sub-Pixel Drizzle & Iterative Back-Projection (IBP)."""
+
+    def __init__(
+        self,
+        tile_size: int = 512,
+        max_tiles: int = 1600,
+        sr_scale: float = 2.0,
+        ibp_gain: float = 0.55,
+        parallax_guard: bool = False,
+    ):
+        self.parallax_guard = bool(parallax_guard)
+        self.ts = tile_size
+        self.max_tiles = max_tiles
+        self.sr_scale = float(np.clip(sr_scale, 1.0, 4.0))
+        self.ibp_gain = float(np.clip(ibp_gain, 0.0, 1.5))
+        self.tiles: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+        self.bounds: tuple[int, int, int, int] | None = None
+        self.feather = None
+        self.feather_shape = None
+        self.sr_updates = 0
+
+    def _weights(self, height: int, width: int) -> np.ndarray:
+        if self.feather_shape != (height, width):
+            margin = max(16, int(min(height, width) * 0.14))
+            x = np.minimum(np.arange(width) + 1, np.arange(width, 0, -1))
+            y = np.minimum(np.arange(height) + 1, np.arange(height, 0, -1))
+            wx = np.clip(x.astype(np.float32) / margin, 0.02, 1.0)
+            wy = np.clip(y.astype(np.float32) / margin, 0.02, 1.0)
+            self.feather = np.minimum(wy[:, None], wx[None, :]).astype(np.float32)
+            self.feather_shape = (height, width)
+        return self.feather
+
+    def add(self, frame: np.ndarray, pose_1x: np.ndarray) -> bool:
+        h, w = frame.shape[:2]
+        s = self.sr_scale
+        scale_mat = np.array([[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        pose_sr = scale_mat @ pose_1x
+
+        corners = transform_points(pose_sr, [(0, 0), (w, 0), (w, h), (0, h)])
+        if not np.isfinite(corners).all():
+            return False
+        x0, y0 = np.floor(corners.min(axis=0)).astype(int) - 2
+        x1, y1 = np.ceil(corners.max(axis=0)).astype(int) + 2
+        bw, bh = x1 - x0, y1 - y0
+        if bw <= 0 or bh <= 0 or bw > int(2.9 * s * w) or bh > int(2.9 * s * h):
+            return False
+        if bw * bh > 24_000_000:
+            return False
+
+        ts = self.ts
+        needed = {
+            (tx, ty)
+            for tx in range(x0 // ts, (x1 - 1) // ts + 1)
+            for ty in range(y0 // ts, (y1 - 1) // ts + 1)
+        }
+        if len(self.tiles.keys() | needed) > self.max_tiles:
+            return False
+
+        relative_sr = np.array([[1.0, 0.0, -x0], [0.0, 1.0, -y0], [0.0, 0.0, 1.0]], dtype=np.float64) @ pose_sr
+        inv_relative_sr = np.linalg.inv(relative_sr)
+
+        warped_base = cv2.warpPerspective(
+            frame.astype(np.float32), relative_sr, (bw, bh), flags=cv2.INTER_LANCZOS4
+        )
+        feather_w = cv2.warpPerspective(
+            self._weights(h, w), relative_sr, (bw, bh), flags=cv2.INTER_LINEAR
+        )
+
+        if s > 1.05:
+            grid_y, grid_x = np.mgrid[0:bh, 0:bw].astype(np.float32)
+            denom = inv_relative_sr[2, 0] * grid_x + inv_relative_sr[2, 1] * grid_y + inv_relative_sr[2, 2]
+            denom = np.where(np.abs(denom) < 1e-7, 1e-7, denom)
+            u_src = (inv_relative_sr[0, 0] * grid_x + inv_relative_sr[0, 1] * grid_y + inv_relative_sr[0, 2]) / denom
+            v_src = (inv_relative_sr[1, 0] * grid_x + inv_relative_sr[1, 1] * grid_y + inv_relative_sr[1, 2]) / denom
+
+            du = u_src - np.rint(u_src)
+            dv = v_src - np.rint(v_src)
+            dist2 = du * du + dv * dv
+            drizzle_kernel = np.exp(-dist2 / (2.0 * (0.34 ** 2))).astype(np.float32)
+            nearest_rgb = cv2.warpPerspective(
+                frame.astype(np.float32), relative_sr, (bw, bh), flags=cv2.INTER_NEAREST
+            )
+            center_affinity = np.clip(drizzle_kernel, 0.0, 1.0)[:, :, None]
+            warped = center_affinity * nearest_rgb + (1.0 - center_affinity) * warped_base
+            total_weight = feather_w * (0.15 + 0.85 * drizzle_kernel)
+        else:
+            warped = warped_base
+            total_weight = feather_w
+
+        valid_rect = feather_w > 0.006
+        if not np.any(valid_rect):
+            return False
+
+        if (self.ibp_gain > 0.01 or self.parallax_guard) and any((tx, ty) in self.tiles for tx, ty in needed):
+            current_sr_canvas = np.zeros((bh, bw, 3), dtype=np.float32)
+            current_sr_cov = np.zeros((bh, bw), dtype=np.float32)
+            for tx, ty in needed:
+                if (tx, ty) not in self.tiles:
+                    continue
+                tile_x, tile_y = tx * ts, ty * ts
+                left, top = max(x0, tile_x), max(y0, tile_y)
+                right, bottom = min(x1, tile_x + ts), min(y1, tile_y + ts)
+                if left >= right or top >= bottom:
+                    continue
+                src_sl = (slice(top - y0, bottom - y0), slice(left - x0, right - x0))
+                dst_sl = (slice(top - tile_y, bottom - tile_y), slice(left - tile_x, right - tile_x))
+                rgb_t, w_t = self.tiles[(tx, ty)]
+                current_sr_canvas[src_sl] = rgb_t[dst_sl]
+                current_sr_cov[src_sl] = w_t[dst_sl]
+
+            has_prior = current_sr_cov > 0.25
+            if self.parallax_guard and np.any(has_prior):
+                # A conservative appearance-change veto: do not accumulate new
+                # RGB into an old pixel when the two views strongly disagree.
+                # This helps with moving foreground and some parallax, but it
+                # does NOT recover metric depth or resolve multiple planes.
+                old_luma = cv2.cvtColor(current_sr_canvas, cv2.COLOR_BGR2GRAY)
+                new_luma = cv2.cvtColor(warped_base, cv2.COLOR_BGR2GRAY)
+                old_luma = cv2.GaussianBlur(old_luma, (5, 5), 1.0)
+                new_luma = cv2.GaussianBlur(new_luma, (5, 5), 1.0)
+                # Exposure offset from valid overlap, with robust median.
+                delta = new_luma[has_prior] - old_luma[has_prior]
+                exposure = float(np.median(delta))
+                residual = np.abs(new_luma - old_luma - exposure)
+                # 38 is deliberately permissive for analog/video noise.
+                consistent = residual <= 38.0
+                # Small dilation catches displaced edges, which otherwise
+                # appear as coloured ghosts after back-projection.
+                bad = cv2.dilate(((~consistent) & has_prior).astype(np.uint8),
+                                 np.ones((5, 5), np.uint8)) > 0
+                total_weight[bad] = 0.0
+                has_prior &= ~bad
+            if self.ibp_gain > 0.01 and np.any(has_prior):
+                sigma_psf = max(0.55, 0.45 * s)
+                blurred_sr = cv2.GaussianBlur(current_sr_canvas, (0, 0), sigma_psf)
+                simulated_cam = cv2.warpPerspective(
+                    blurred_sr,
+                    inv_relative_sr,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                )
+                cam_error = frame.astype(np.float32) - simulated_cam
+                up_error = cv2.warpPerspective(cam_error, relative_sr, (bw, bh), flags=cv2.INTER_CUBIC)
+                warped = np.where(
+                    has_prior[:, :, None],
+                    np.clip(current_sr_canvas + up_error * (1.0 + self.ibp_gain), 0.0, 255.0),
+                    warped,
+                )
+                self.sr_updates += 1
+
+        for tx, ty in needed:
+            tile_x, tile_y = tx * ts, ty * ts
+            left, top = max(x0, tile_x), max(y0, tile_y)
+            right, bottom = min(x1, tile_x + ts), min(y1, tile_y + ts)
+            if left >= right or top >= bottom:
+                continue
+            source = (slice(top - y0, bottom - y0), slice(left - x0, right - x0))
+            incoming_weight = total_weight[source]
+            if not np.any(valid_rect[source]):
+                continue
+
+            if (tx, ty) not in self.tiles:
+                self.tiles[(tx, ty)] = (
+                    np.zeros((ts, ts, 3), dtype=np.float32),
+                    np.zeros((ts, ts), dtype=np.float32),
+                )
+            rgb_tile, w_tile = self.tiles[(tx, ty)]
+            dest = (slice(top - tile_y, bottom - tile_y), slice(left - tile_x, right - tile_x))
+            old_rgb = rgb_tile[dest]
+            old_weight = w_tile[dest]
+
+            new_weight = np.where(valid_rect[source], incoming_weight, 0.0)
+            mix = (new_weight / (old_weight + new_weight + 1e-9))[:, :, None]
+            blended = old_rgb * (1.0 - mix) + warped[source] * mix
+            old_rgb[:] = np.clip(blended, 0.0, 255.0)
+            old_weight[:] = np.minimum(old_weight + new_weight, 10.0)
+
+        if self.bounds is None:
+            self.bounds = (x0, y0, x1, y1)
+        else:
+            a, b, c, d = self.bounds
+            self.bounds = (min(a, x0), min(b, y0), max(c, x1), max(d, y1))
+        return True
+
+    def extract_roi_sr(self, center_1x: np.ndarray, roi_w_sr: int, roi_h_sr: int) -> np.ndarray:
+        cx = int(round(center_1x[0] * self.sr_scale))
+        cy = int(round(center_1x[1] * self.sr_scale))
+        x0, y0 = cx - roi_w_sr // 2, cy - roi_h_sr // 2
+        x1, y1 = x0 + roi_w_sr, y0 + roi_h_sr
+        out = np.full((roi_h_sr, roi_w_sr, 3), (25, 27, 32), dtype=np.uint8)
+        ts = self.ts
+        for tx in range(x0 // ts, (x1 - 1) // ts + 1):
+            for ty in range(y0 // ts, (y1 - 1) // ts + 1):
+                if (tx, ty) not in self.tiles:
+                    continue
+                tile_x, tile_y = tx * ts, ty * ts
+                l, t = max(x0, tile_x), max(y0, tile_y)
+                r, b = min(x1, tile_x + ts), min(y1, tile_y + ts)
+                if l >= r or t >= b:
+                    continue
+                rgb_f32, w_f32 = self.tiles[(tx, ty)]
+                sub_rgb = np.clip(np.rint(rgb_f32[t - tile_y : b - tile_y, l - tile_x : r - tile_x]), 0, 255).astype(np.uint8)
+                sub_m = w_f32[t - tile_y : b - tile_y, l - tile_x : r - tile_x] > 0.006
+                dest = out[t - y0 : b - y0, l - x0 : r - x0]
+                np.copyto(dest, sub_rgb, where=sub_m[:, :, None])
+        return out
+
+    def preview(
+        self,
+        width: int,
+        height: int,
+        camera_pose_1x: np.ndarray | None,
+        frame_size: tuple[int, int] | None,
+        keyframes: list[Keyframe],
+        adjustments: ImageAdjustments | None = None,
+        zoom: float = 1.0,
+    ) -> np.ndarray:
+        view = np.full((height, width, 3), (29, 31, 35), np.uint8)
+        if self.bounds is None:
+            return view
+        x0, y0, x1, y1 = self.bounds
+        extent_w, extent_h = max(1, x1 - x0), max(1, y1 - y0)
+        zoom = float(np.clip(zoom, 1.0, 12.0))
+        scale = min((width - 24) / extent_w, (height - 24) / extent_h) * zoom
+        # At higher viewer magnification follow the tracked camera, rather than
+        # zooming into the ever-expanding atlas bounding box.
+        focus = np.array([(x0 + x1) * .5, (y0 + y1) * .5], np.float64)
+        if zoom > 1.001 and camera_pose_1x is not None and frame_size is not None:
+            focus = center_of(camera_pose_1x, frame_size) * self.sr_scale
+        ox = width * .5 - (focus[0] - x0) * scale
+        oy = height * .5 - (focus[1] - y0) * scale
+        ts = self.ts
+        s = self.sr_scale
+        coverage = (
+            np.zeros((height, width), np.uint8)
+            if adjustments is not None and adjustments.active
+            else None
+        )
+        for (tx, ty), (rgb_f32, weights) in self.tiles.items():
+            u0 = int(round((tx * ts - x0) * scale + ox))
+            v0 = int(round((ty * ts - y0) * scale + oy))
+            u1 = int(round(((tx + 1) * ts - x0) * scale + ox))
+            v1 = int(round(((ty + 1) * ts - y0) * scale + oy))
+            if u1 <= u0 or v1 <= v0:
+                continue
+            l, t, r, b = max(0, u0), max(0, v0), min(width, u1), min(height, v1)
+            if r <= l or b <= t:
+                continue
+            # Sample only the visible portion of each tile. At 12x view zoom,
+            # resizing the whole tile would allocate enormous off-screen images.
+            mx = ((np.arange(l, r, dtype=np.float32) + .5 - u0)
+                  * ts / max(1, u1-u0) - .5)
+            my = ((np.arange(t, b, dtype=np.float32) + .5 - v0)
+                  * ts / max(1, v1-v0) - .5)
+            map_x, map_y = np.meshgrid(mx, my)
+            rgb_u8 = np.clip(np.rint(rgb_f32), 0, 255).astype(np.uint8)
+            sampled = cv2.remap(rgb_u8, map_x, map_y, cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT)
+            valid = cv2.remap((weights > .006).astype(np.uint8), map_x, map_y,
+                              cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+            dest = view[t:b, l:r]
+            np.copyto(dest, sampled, where=valid[:, :, None].astype(bool))
+            if coverage is not None:
+                coverage[t:b, l:r] |= valid
+
+        if coverage is not None:
+            view = adjustments.apply(view, mask=coverage)
+
+        for key in keyframes[-120:]:
+            px = int((key.center[0] * s - x0) * scale + ox)
+            py = int((key.center[1] * s - y0) * scale + oy)
+            if 0 <= px < width and 0 <= py < height:
+                cv2.circle(view, (px, py), 2, (190, 130, 65), -1, cv2.LINE_AA)
+        if camera_pose_1x is not None and frame_size is not None:
+            w, h = frame_size
+            quad = transform_points(camera_pose_1x, [(0, 0), (w, 0), (w, h), (0, h)]) * s
+            quad = np.rint((quad - [x0, y0]) * scale + [ox, oy]).astype(np.int32)
+            cv2.polylines(view, [quad], True, (60, 220, 130), 2, cv2.LINE_AA)
+        return view
+
+    def save(
+        self,
+        path: Path,
+        max_megapixels: float = 120.0,
+        adjustments: ImageAdjustments | None = None,
+    ) -> tuple[int, int, float]:
+        if self.bounds is None:
+            raise RuntimeError("No mosaic content yet")
+        x0, y0, x1, y1 = self.bounds
+        width, height = x1 - x0, y1 - y0
+        factor = min(1.0, math.sqrt(max_megapixels * 1_000_000 / max(1, width * height)))
+        export_w = max(1, int(math.ceil(width * factor)))
+        export_h = max(1, int(math.ceil(height * factor)))
+        out = np.zeros((export_h, export_w, 4), dtype=np.uint8)
+        ts = self.ts
+        for (tx, ty), (rgb_f32, weights) in self.tiles.items():
+            left, top = tx * ts, ty * ts
+            right, bottom = left + ts, top + ts
+            l, t = max(0, int((left - x0) * factor)), max(0, int((top - y0) * factor))
+            r = min(export_w, int(math.ceil((right - x0) * factor)))
+            b = min(export_h, int(math.ceil((bottom - y0) * factor)))
+            if r <= l or b <= t:
+                continue
+            src_x = (np.arange(l, r) + 0.5) / factor + x0 - left
+            src_y = (np.arange(t, b) + 0.5) / factor + y0 - top
+            indices_x = np.clip(src_x.astype(np.int32), 0, ts - 1)
+            indices_y = np.clip(src_y.astype(np.int32), 0, ts - 1)
+            patch = np.clip(np.rint(rgb_f32[np.ix_(indices_y, indices_x)]), 0, 255).astype(np.uint8)
+            alpha = ((weights[np.ix_(indices_y, indices_x)] > 0.006) * 255).astype(np.uint8)
+            out[t:b, l:r, :3] = patch
+            out[t:b, l:r, 3] = alpha
+
+        if adjustments is not None:
+            adjustments.apply_rgba_inplace(out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(str(path), out, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        if not ok:
+            raise OSError(f"Cannot write {path}")
+        return export_w, export_h, factor
+
+
+# ---------------------------------------------------------------------------
+# Step (b): Zoom/Movement Aware Moire Alignment + Rigidity Guards
+# ---------------------------------------------------------------------------
+
+class SweepAtlasSigh:
+    """Aligns frames via EQ'd Moire carrier + Euclidean/Similarity/Affine constraints and sub-pixel polish."""
+
+    def __init__(
+        self,
+        mode: str = "similarity",
+        moire_width: int = 320,
+        min_inliers: int = 10,
+        tile_size: int = 512,
+        max_tiles: int = 1600,
+        predictor: bool = True,
+        sr_scale: float = 2.0,
+        ibp_gain: float = 0.55,
+        parallax_guard: bool = False,
+        zoom_limit: float = 1.55,
+        rgb_features: bool = True,
+    ):
+        self.zoom_limit = float(np.clip(zoom_limit, 1.01, 2.5))
+        self.rgb_features = bool(rgb_features)
+        self.rgb_width = 640
+        self.rgb_orb = cv2.ORB_create(nfeatures=1400, scaleFactor=1.15,
+                                      nlevels=10, edgeThreshold=15,
+                                      patchSize=31, fastThreshold=10)
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        self.mode = mode
+        self.moire_width = moire_width
+        self.min_inliers = min_inliers
+        self.tiles = AtlasTiles(tile_size, max_tiles, sr_scale=sr_scale,
+                                ibp_gain=ibp_gain, parallax_guard=parallax_guard)
+        self.eq = SighMoireEQ(work_size=(moire_width, int(round(moire_width * 9 / 16))))
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        self.keyframes: list[Keyframe] = []
+        self.pose: np.ndarray | None = None
+        self.size: tuple[int, int] | None = None
+        self.number = 0
+        self.added = 0
+        self.lost = 0
+        self.closures = 0
+        self.velocity = np.zeros(2, np.float64)
+        self.predictor = predictor
+        self.last_inliers = 0
+        self.last_phase_resp = 0.0
+        self.last_match_method = "INIT"
+        self.last_zoom = 1.0
+        self.last_moire_u8: np.ndarray | None = None
+        self.last_kps: list = []
+        self.last_status = f"Super-Res ({sr_scale:.1f}x) active [Mode: {mode}]: zoom/movement guard enabled."
+        self.last_add_center: np.ndarray | None = None
+        self.last_added_at = 0.0
+
+    def _estimate_model(self, src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
+        """Fit a bounded geometric warp; scale limits apply relative to a KEYFRAME.
+
+        RANSAC returns a candidate, never an authorization to merge pixels.
+        """
+        if len(src) < self.min_inliers:
+            return None
+        try:
+            if self.mode == "homography":
+                h, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.2,
+                                              maxIters=2500, confidence=0.995)
+                if h is None or mask is None or not np.isfinite(h).all():
+                    return None
+                # Inspect local Jacobian scales rather than only det(H[:2,:2]):
+                # the latter has no useful meaning for a projective transform.
+                spread = np.vstack([src.min(axis=0), src.max(axis=0),
+                                    src.mean(axis=0)])
+                for q in spread:
+                    u, v = float(q[0]), float(q[1])
+                    a,b,c,d,e,f,g,j,k = h.reshape(-1)
+                    den = g*u + j*v + k
+                    if abs(den) < 1e-6:
+                        return None
+                    jac = np.array([[(a*den-(a*u+b*v+c)*g)/den**2,
+                                     (b*den-(a*u+b*v+c)*j)/den**2],
+                                    [(d*den-(d*u+e*v+f)*g)/den**2,
+                                     (e*den-(d*u+e*v+f)*j)/den**2]])
+                    sigmas = np.linalg.svd(jac, compute_uv=False)
+                    if sigmas.min() < 1/self.zoom_limit or sigmas.max() > self.zoom_limit:
+                        return None
+                    if sigmas.max()/max(sigmas.min(),1e-7) > 1.6:
+                        return None
+                return h / h[2, 2]
+            if self.mode == "affine":
+                affine, mask = cv2.estimateAffine2D(
+                    src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0,
+                    maxIters=2500, confidence=0.995, refineIters=15)
+            else:
+                affine, mask = cv2.estimateAffinePartial2D(
+                    src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0,
+                    maxIters=2500, confidence=0.995, refineIters=15)
+            if affine is None or mask is None or not np.isfinite(affine).all():
+                return None
+            if self.mode == "euclidean":
+                # No true zoom in Euclidean mode; reject instead of silently
+                # stripping scale off an otherwise good RANSAC estimate.
+                scale = float(np.linalg.svd(affine[:, :2], compute_uv=False).mean())
+                if not 0.97 <= scale <= 1.03:
+                    return None
+                affine[:, :2] /= scale
+            else:
+                sigmas = np.linalg.svd(affine[:, :2], compute_uv=False)
+                if sigmas.min() < 1/self.zoom_limit or sigmas.max() > self.zoom_limit:
+                    return None
+                if self.mode == "affine" and sigmas.max()/max(sigmas.min(),1e-7) > 1.25:
+                    return None
+            return np.vstack([affine, [0.0, 0.0, 1.0]])
+        except (cv2.error, np.linalg.LinAlgError, FloatingPointError):
+            return None
+
+    def _rgb_features(self, gray_full: np.ndarray) -> tuple[list, np.ndarray | None]:
+        """Conventional scale-pyramid features complement non-scale-invariant moire extrema."""
+        h, w = gray_full.shape
+        factor = min(1., self.rgb_width / max(1, w))
+        im = cv2.resize(gray_full.astype(np.uint8),
+                        (max(1, round(w*factor)), max(1, round(h*factor))),
+                        interpolation=cv2.INTER_AREA if factor < 1 else cv2.INTER_LINEAR)
+        im = self.clahe.apply(im)
+        kp, desc = self.rgb_orb.detectAndCompute(im, None)
+        return kp or [], desc
+
+    def _match_rgb(self, rgb_kps: list, rgb_desc: np.ndarray | None,
+                   reference: Keyframe) -> Match | None:
+        if rgb_desc is None or reference.rgb_descriptors is None or len(rgb_desc) < 10:
+            return None
+        full_w, full_h = self.size
+        factor = min(1., self.rgb_width / max(1, full_w))
+        matches = self.matcher.knnMatch(rgb_desc, reference.rgb_descriptors, k=2)
+        good = [m for pair in matches if len(pair) == 2 for m,n in [pair]
+                if m.distance < .78*n.distance]
+        good.sort(key=lambda m: m.distance)
+        seen = set()
+        unique = []
+        for m in good:
+            if m.trainIdx not in seen:
+                seen.add(m.trainIdx)
+                unique.append(m)
+        if len(unique) < max(12, self.min_inliers):
+            return None
+        src = np.float32([rgb_kps[m.queryIdx].pt for m in unique])
+        dst = np.float32([reference.rgb_keypoints[m.trainIdx].pt for m in unique])
+        raw = self._estimate_model(src, dst)
+        if raw is None:
+            return None
+        err = np.linalg.norm(transform_points(raw, src) - dst, axis=1)
+        inliers = err < 3.2
+        n = int(inliers.sum())
+        if n < max(12, self.min_inliers) or n / len(unique) < .28:
+            return None
+        # An isolated textured item on a different depth plane cannot safely
+        # anchor the whole room. Require geometric support across the image.
+        pts = src[inliers]
+        bounds = np.ptp(pts, axis=0)
+        fw, fh = round(full_w*factor), round(full_h*factor)
+        coverage = float((bounds[0]/max(1,fw)) * (bounds[1]/max(1,fh)))
+        if coverage < .035 or min(bounds[0]/max(1,fw),bounds[1]/max(1,fh)) < .10:
+            return None
+        pixscale = np.diag([1/factor,1/factor,1.])
+        relative = pixscale @ raw @ np.linalg.inv(pixscale)
+        pose = reference.pose @ relative
+        if abs(pose[2,2]) < 1e-8 or not np.isfinite(pose).all():
+            return None
+        pose /= pose[2,2]
+        center = center_of(pose,self.size)
+        if not np.isfinite(center).all() or max(abs(center)) > 1e5:
+            return None
+        zoom = abs(float(np.linalg.det(raw[:2,:2])))**.5 if self.mode != 'homography' else 1.0
+        return Match(pose, n, len(unique), float(np.median(err[inliers]))/factor,
+                     0.0, reference, 'RGB', coverage, zoom)
+
+    def _match_moire(
+        self,
+        moire_u8: np.ndarray,
+        moire_f32: np.ndarray,
+        gray_full: np.ndarray,
+        kps: list,
+        desc: np.ndarray | None,
+        reference: Keyframe,
+    ) -> Match | None:
+        full_w, full_h = self.size
+        mw, mh = self.eq.work_w, self.eq.work_h
+        sx, sy = full_w / mw, full_h / mh
+        scale_up = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], dtype=np.float64)
+        scale_dn = np.array([[1.0 / sx, 0, 0], [0, 1.0 / sy, 0], [0, 0, 1]], dtype=np.float64)
+
+        (dx, dy), phase_resp = cv2.phaseCorrelate(reference.moire_f32, moire_f32)
+        phase_tx = -dx
+        phase_ty = -dy
+
+        raw_model = None
+        inlier_count = 0
+        unique_count = 0
+        reproj_err = 9.9
+
+        if desc is not None and reference.descriptors is not None and len(desc) >= 8 and len(reference.descriptors) >= 8:
+            pairs = self.matcher.knnMatch(desc, reference.descriptors, k=2)
+            good = [a for pair in pairs if len(pair) == 2 for a, b in [pair] if a.distance < 0.82 * b.distance]
+            good.sort(key=lambda m: m.distance)
+            used = set()
+            unique = []
+            for m in good:
+                if m.trainIdx not in used:
+                    unique.append(m)
+                    used.add(m.trainIdx)
+            unique_count = len(unique)
+
+            if unique_count >= self.min_inliers:
+                src = np.float32([kps[m.queryIdx].pt for m in unique])
+                dst = np.float32([reference.keypoints[m.trainIdx].pt for m in unique])
+                raw = self._estimate_model(src, dst)
+                if raw is not None:
+                    # Verify inliers
+                    transformed_pts = transform_points(raw, src)
+                    errs = np.linalg.norm(transformed_pts - dst, axis=1)
+                    good_mask = errs <= 3.2
+                    n = int(good_mask.sum())
+                    if n >= self.min_inliers:
+                        err = float(np.median(errs[good_mask]))
+                        if err <= 3.6:
+                            raw_model = raw
+                            inlier_count = n
+                            reproj_err = err
+
+        if raw_model is None:
+            if (self.mode == "euclidean" and phase_resp >= 0.55
+                    and math.hypot(phase_tx, phase_ty) < 0.35 * max(mw, mh)):
+                raw_model = np.array([[1.0, 0.0, phase_tx], [0.0, 1.0, phase_ty], [0.0, 0.0, 1.0]], dtype=np.float64)
+                inlier_count = int(round(phase_resp * 35))
+                unique_count = max(unique_count, inlier_count)
+                reproj_err = max(0.3, 2.2 * (1.0 - min(1.0, phase_resp)))
+            else:
+                return None
+
+        relative = scale_up @ raw_model @ scale_dn
+
+        # Full-Resolution Sub-Pixel Translation Polish
+        warped_gray = cv2.warpPerspective(gray_full, relative, (full_w, full_h), flags=cv2.INTER_LINEAR)
+        cw, ch = int(full_w * 0.7), int(full_h * 0.7)
+        cx0, cy0 = (full_w - cw) // 2, (full_h - ch) // 2
+        ref_crop = reference.gray_full[cy0 : cy0 + ch, cx0 : cx0 + cw]
+        wrp_crop = warped_gray[cy0 : cy0 + ch, cx0 : cx0 + cw]
+        if ref_crop.shape == wrp_crop.shape and ref_crop.size > 0:
+            hann_win = np.outer(np.hanning(ch), np.hanning(cw)).astype(np.float32)
+            (sub_dx, sub_dy), sub_resp = cv2.phaseCorrelate(ref_crop * hann_win, wrp_crop * hann_win)
+            if sub_resp > 0.18 and math.hypot(sub_dx, sub_dy) < 6.0:
+                polish = np.array([[1.0, 0.0, -sub_dx], [0.0, 1.0, -sub_dy], [0.0, 0.0, 1.0]], dtype=np.float64)
+                relative = polish @ relative
+                reproj_err = min(reproj_err, max(0.08, float(math.hypot(sub_dx, sub_dy)) * 0.25))
+
+        corners = transform_points(relative, [(0, 0), (full_w, 0), (full_w, full_h), (0, full_h)])
+        if not np.isfinite(corners).all():
+            return None
+        area = abs(float(cv2.contourArea(corners.astype(np.float32))))
+        if not (0.50 * full_w * full_h <= area <= 2.0 * full_w * full_h):
+            return None
+
+        candidate_pose = reference.pose @ relative
+        if abs(candidate_pose[2, 2]) < 1e-10:
+            return None
+        candidate_pose = candidate_pose / candidate_pose[2, 2]
+        c = center_of(candidate_pose, (full_w, full_h))
+        if not np.isfinite(c).all() or np.max(np.abs(c)) > 100_000:
+            return None
+
+        sc = abs(float(np.linalg.det(raw_model[:2, :2])))**.5 if self.mode != 'homography' else 1.0
+        return Match(candidate_pose, inlier_count, unique_count, reproj_err,
+                     float(phase_resp), reference, 'MOIRE', 0.0, sc)
+
+    def _candidate_references(self, force_relocalize: bool = False) -> list[Keyframe]:
+        if not self.keyframes:
+            return []
+        if force_relocalize:
+            return self.keyframes[-120:]
+        if self.pose is None:
+            return self.keyframes[-1:]
+        prediction = center_of(self.pose, self.size) + (self.velocity if self.predictor else 0)
+        latest = self.keyframes[-1]
+        choices = [latest]
+        others = sorted(self.keyframes[:-1], key=lambda k: np.linalg.norm(k.center - prediction))
+        diagonal = float(np.hypot(*self.size))
+        for k in others:
+            if len(choices) >= 6:
+                break
+            if np.linalg.norm(k.center - prediction) < diagonal * 1.35:
+                choices.append(k)
+        return choices
+
+    def process(self, frame: np.ndarray, relocalize: bool = False) -> bool:
+        if frame is None or frame.ndim != 3:
+            self.last_status = "Invalid camera frame"
+            return False
+        height, width = frame.shape[:2]
+        if self.size is None:
+            self.size = (width, height)
+        elif self.size != (width, height):
+            frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_AREA)
+
+        self.number += 1
+        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        moire_u8, moire_f32, kps, desc = self.eq.transform(frame)
+        rgb_kps, rgb_desc = self._rgb_features(gray_full) if self.rgb_features else ([], None)
+        self.last_moire_u8 = moire_u8
+        self.last_kps = kps
+
+        if self.pose is None:
+            self.pose = np.eye(3, dtype=np.float64)
+            if not self.tiles.add(frame, self.pose):
+                self.last_status = "Cannot allocate first SR atlas tile"
+                return False
+            c = center_of(self.pose, self.size)
+            self.keyframes.append(Keyframe(self.number, moire_u8, moire_f32, gray_full,
+                                               kps, desc, self.pose.copy(), c,
+                                               rgb_kps, rgb_desc))
+            self.last_add_center = c
+            self.last_added_at = time.monotonic()
+            self.added += 1
+            self.last_status = f"SR Atlas ({self.tiles.sr_scale:.1f}x) initialized [Mode: {self.mode}]"
+            return True
+
+        refs = self._candidate_references(relocalize or self.lost >= 4)
+        matches = []
+        for ref in refs:
+            if self.rgb_features:
+                m = self._match_rgb(rgb_kps, rgb_desc, ref)
+                if m is not None:
+                    matches.append(m)
+            m = self._match_moire(moire_u8, moire_f32, gray_full, kps, desc, ref)
+            if m is not None:
+                matches.append(m)
+        if not matches:
+            self.lost += 1
+            self.last_inliers = 0
+            self.last_status = f"Alignment lost ({self.lost}); too fast, parallax, blur or too few features"
+            return False
+
+        predicted = center_of(self.pose, self.size) + (self.velocity if self.predictor else 0)
+
+        def rank(m: Match) -> float:
+            dist = np.linalg.norm(center_of(m.pose, self.size) - predicted)
+            # Prefer well-spread RGB evidence over possibly scale-aliased moire
+            # extrema; do not select old references solely for extra matches.
+            return (0.38*m.inliers + 8.0*m.coverage +
+                    (6.0 if m.method == 'RGB' else 0.0) +
+                    2.0*m.phase_response - 0.9*m.error - 0.006*dist)
+
+        best = max(matches, key=rank)
+        # Prevent large jumps/zoom changes from single bad feature clusters.
+        # A true video zoom is accepted; an impossible jump is not merged.
+        if best.method == 'MOIRE' and self.rgb_features:
+            strong_rgb = [m for m in matches if m.method == 'RGB' and m.inliers >= max(12,self.min_inliers)]
+            if strong_rgb:
+                best_rgb = max(strong_rgb, key=rank)
+                if rank(best_rgb) >= rank(best) - 5:
+                    best = best_rgb
+        old_center = center_of(self.pose, self.size)
+        new_center = center_of(best.pose, self.size)
+        shift = float(np.linalg.norm(new_center - old_center))
+        limit = max(width, height) * (2.0 if self.lost >= 4 else 1.05)
+        if shift > limit:
+            self.lost += 1
+            self.last_status = "Rejected implausible camera jump"
+            return False
+
+        self.pose = best.pose
+        self.velocity = 0.55 * self.velocity + 0.45 * (new_center - old_center)
+        self.lost = 0
+        self.last_inliers = best.inliers
+        self.last_phase_resp = best.phase_response
+        self.last_match_method = best.method
+        self.last_zoom = best.zoom
+        closure = self.number - best.reference.number >= 22
+        if closure and shift > 3:
+            self.closures += 1
+
+        already = float(np.linalg.norm(new_center - self.last_add_center)) if self.last_add_center is not None else 1e9
+        now = time.monotonic()
+        min_step = 0.35 if self.tiles.sr_scale > 1.05 else 9.0
+        if already >= min_step or now - self.last_added_at > 1.5:
+            if not self.tiles.add(frame, self.pose):
+                self.last_status = "SR Atlas tile limit reached; save mosaic now"
+                return False
+            self.added += 1
+            self.last_add_center = new_center.copy()
+            self.last_added_at = now
+
+        latest = self.keyframes[-1]
+        distance = np.linalg.norm(new_center - latest.center)
+        try:
+            key_delta = np.linalg.inv(latest.pose) @ self.pose
+            zoom_delta = abs(float(np.linalg.det(key_delta[:2,:2])))**.5
+        except np.linalg.LinAlgError:
+            zoom_delta = 1.0
+        zoom_changed = not (0.90 < zoom_delta < 1.10)
+        if ((distance >= min(width, height) * 0.17 or
+             self.number - latest.number >= 12 or zoom_changed)
+                and (len(kps) >= self.min_inliers or len(rgb_kps) >= max(12,self.min_inliers))):
+            self.keyframes.append(Keyframe(self.number, moire_u8, moire_f32, gray_full,
+                                           kps, desc, self.pose.copy(), new_center.copy(),
+                                           rgb_kps, rgb_desc))
+            if len(self.keyframes) > 220:
+                self.keyframes = self.keyframes[::2][:-48] + self.keyframes[-48:]
+
+        tag = " | re-anchored" if closure else ""
+        self.last_status = (
+            f"SR {self.tiles.sr_scale:.1f}x [{self.mode}] | {best.method}:{best.inliers}/{best.good} | "
+            f"zoom:{best.zoom:.2f}x err:{best.error:.2f}px shift:{shift:.1f}px{tag}"
+        )
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Interactive UI: Live Camera + Crop Box + Moire Carrier + SR Atlas + 1:1 Loupe
+# ---------------------------------------------------------------------------
+
+LEFT_X0, LEFT_X1 = 0, 760
+LEFT_Y0, LEFT_Y1 = 42, 482
+LEFT_W, LEFT_H = LEFT_X1 - LEFT_X0, LEFT_Y1 - LEFT_Y0
+
+EQ_X0, EQ_X1 = 24, 624
+EQ_Y0, EQ_Y1 = 562, 636
+
+TL_X0, TL_X1 = 660, 1500
+TL_Y0, TL_Y1 = 588, 612
+
+
+def label(image: np.ndarray, text: str, position: tuple[int, int], color=(238, 238, 238), size=0.52):
+    cv2.putText(image, text, position, cv2.FONT_HERSHEY_SIMPLEX, size, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(image, text, position, cv2.FONT_HERSHEY_SIMPLEX, size, color, 1, cv2.LINE_AA)
+
+
+def render_moire_inset(moire_u8: np.ndarray | None, kps: list, width: int, height: int) -> np.ndarray:
+    if moire_u8 is None:
+        return np.zeros((height, width, 3), dtype=np.uint8)
+    colored = cv2.applyColorMap(moire_u8, cv2.COLORMAP_INFERNO)
+    mh, mw = moire_u8.shape[:2]
+    vis = cv2.resize(colored, (width, height), interpolation=cv2.INTER_LINEAR)
+    sx, sy = width / max(1, mw), height / max(1, mh)
+    for kp in kps[:160]:
+        px = int(round(kp.pt[0] * sx))
+        py = int(round(kp.pt[1] * sy))
+        if 0 <= px < width and 0 <= py < height:
+            cv2.circle(vis, (px, py), 2, (120, 255, 180), -1, cv2.LINE_AA)
+    return vis
+
+
+def draw_crop_overlay_on_pane(
+    pane: np.ndarray,
+    crop_norm: tuple[float, float, float, float] | None,
+    drag_box_pane: tuple[int, int, int, int] | None,
+    raw_frame_shape: tuple[int, int] | None = None,
+    in_moire_mode: bool = False,
+) -> None:
+    ph, pw = pane.shape[:2]
+    box_px = None
+    is_dragging = False
+
+    if drag_box_pane is not None:
+        x0, y0, x1, y1 = drag_box_pane
+        bx0, bx1 = int(np.clip(min(x0, x1), 0, pw - 1)), int(np.clip(max(x0, x1), 0, pw - 1))
+        by0, by1 = int(np.clip(min(y0, y1), 0, ph - 1)), int(np.clip(max(y0, y1), 0, ph - 1))
+        box_px = (bx0, by0, bx1, by1)
+        is_dragging = True
+    elif crop_norm is not None and not in_moire_mode:
+        nx0, ny0, nx1, ny1 = crop_norm
+        bx0 = int(round(np.clip(min(nx0, nx1), 0.0, 1.0) * pw))
+        by0 = int(round(np.clip(min(ny0, ny1), 0.0, 1.0) * ph))
+        bx1 = int(round(np.clip(max(nx0, nx1), 0.0, 1.0) * pw))
+        by1 = int(round(np.clip(max(ny0, ny1), 0.0, 1.0) * ph))
+        box_px = (bx0, by0, bx1, by1)
+
+    if box_px is not None:
+        bx0, by0, bx1, by1 = box_px
+        if bx1 > bx0 + 4 and by1 > by0 + 4:
+            dark = (pane.astype(np.uint16) * 38 // 100).astype(np.uint8)
+            inside_mask = np.zeros((ph, pw), dtype=bool)
+            inside_mask[by0:by1, bx0:bx1] = True
+            pane[~inside_mask] = dark[~inside_mask]
+
+            color = (80, 235, 255) if is_dragging else (255, 220, 65)
+            cv2.rectangle(pane, (bx0, by0), (bx1, by1), color, 2, cv2.LINE_AA)
+            for cx, cy in [(bx0, by0), (bx1, by0), (bx1, by1), (bx0, by1)]:
+                cv2.rectangle(pane, (cx - 4, cy - 4), (cx + 4, cy + 4), color, -1)
+
+            if raw_frame_shape is not None and not is_dragging and crop_norm is not None:
+                fh, fw = raw_frame_shape
+                cw = int(round((crop_norm[2] - crop_norm[0]) * fw)) & ~1
+                ch = int(round((crop_norm[3] - crop_norm[1]) * fh)) & ~1
+                tag = f"ACTIVE CROP: {cw}x{ch} px (X or Right-Click to clear)"
+            else:
+                tag = "DRAGGING CROP BOX... release mouse to apply"
+            ty = max(20, by0 - 8) if by0 > 26 else min(ph - 12, by1 + 18)
+            label(pane, tag, (max(8, bx0 + 4), ty), color, 0.44)
+    elif in_moire_mode and crop_norm is not None and raw_frame_shape is not None:
+        fh, fw = raw_frame_shape
+        cw = int(round((crop_norm[2] - crop_norm[0]) * fw)) & ~1
+        ch = int(round((crop_norm[3] - crop_norm[1]) * fh)) & ~1
+        cv2.rectangle(pane, (2, 2), (pw - 3, ph - 3), (255, 220, 65), 2)
+        label(
+            pane,
+            f"CROPPED MOIRE VIEW ({cw}x{ch} px) | Drag to sub-crop | X / Right-Click to reset full frame",
+            (12, 24),
+            (255, 225, 90),
+            0.44,
+        )
+
+
+def render_sr_comparison_loupe(cropped_frame: np.ndarray, atlas: SweepAtlasSigh, width: int, height: int) -> np.ndarray:
+    half_w = width // 2
+    fh, fw = cropped_frame.shape[:2]
+    s = atlas.tiles.sr_scale
+    src_w = max(16, int(round(half_w / (s * 1.5))))
+    src_h = max(16, int(round(height / (s * 1.5))))
+    x0 = max(0, (fw - src_w) // 2)
+    y0 = max(0, (fh - src_h) // 2)
+    raw_crop = cropped_frame[y0 : y0 + src_h, x0 : x0 + src_w]
+    raw_zoom = cv2.resize(raw_crop, (half_w, height), interpolation=cv2.INTER_NEAREST)
+
+    if atlas.pose is not None:
+        c_1x = center_of(atlas.pose, (fw, fh))
+        sr_patch = atlas.tiles.extract_roi_sr(c_1x, int(round(src_w * s)), int(round(src_h * s)))
+        sr_zoom = cv2.resize(sr_patch, (width - half_w, height), interpolation=cv2.INTER_NEAREST)
+    else:
+        sr_zoom = np.zeros((height, width - half_w, 3), dtype=np.uint8)
+
+    comp = np.hstack([raw_zoom, sr_zoom])
+    cv2.line(comp, (half_w, 0), (half_w, height), (240, 210, 90), 2)
+    label(comp, "1x RAW INPUT (NEAREST)", (8, 18), (220, 220, 220), 0.40)
+    label(comp, f"{s:.1f}x SUPER-RES DRIZZLE+IBP", (half_w + 8, 18), (110, 250, 160), 0.40)
+    return comp
+
+
+def draw_eq_widget(canvas: np.ndarray, eq: SighMoireEQ) -> None:
+    cv2.rectangle(canvas, (EQ_X0, EQ_Y0), (EQ_X1, EQ_Y1), (38, 40, 46), -1)
+    cv2.rectangle(canvas, (EQ_X0, EQ_Y0), (EQ_X1, EQ_Y1), (75, 82, 94), 1)
+    w = EQ_X1 - EQ_X0
+    h = EQ_Y1 - EQ_Y0
+    n = eq.num_bands
+    band_w = w / n
+
+    xs = np.linspace(0, w - 1, w)
+    centers = (np.arange(n) + 0.5) * band_w
+    interp_g = np.interp(xs, centers, eq.gains)
+    poly = [(EQ_X0, EQ_Y1)]
+    for x, g in zip(xs, interp_g):
+        py = int(round(EQ_Y1 - g * (h - 8)))
+        poly.append((int(round(EQ_X0 + x)), py))
+    poly.append((EQ_X1, EQ_Y1))
+    cv2.fillPoly(canvas, [np.array(poly, dtype=np.int32)], (185, 115, 50))
+    cv2.polylines(canvas, [np.array(poly[1:-1], dtype=np.int32)], False, (240, 185, 95), 2, cv2.LINE_AA)
+
+    for i, g in enumerate(eq.gains):
+        cx = int(round(EQ_X0 + (i + 0.5) * band_w))
+        cy = int(round(EQ_Y1 - g * (h - 8)))
+        cv2.circle(canvas, (cx, cy), 5, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 5, (20, 20, 20), 1, cv2.LINE_AA)
+
+
+def build_ui_frame(
+    raw_frame: np.ndarray,
+    cropped_frame: np.ndarray,
+    atlas: SweepAtlasSigh,
+    paused: bool,
+    fps: float,
+    message: str = "",
+    adjustments: ImageAdjustments | None = None,
+    show_moire_main: bool = False,
+    show_sr_loupe: bool = True,
+    view_zoom: float = 1.0,
+    video_info: tuple[str, int, int] | None = None,
+    crop_norm: tuple[float, float, float, float] | None = None,
+    drag_box_pane: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
+    left_w, left_h = LEFT_W, LEFT_H
+    right_w, right_h = 760, 440
+
+    if show_moire_main and atlas.last_moire_u8 is not None:
+        left = render_moire_inset(atlas.last_moire_u8, atlas.last_kps, left_w, left_h)
+        draw_crop_overlay_on_pane(
+            left,
+            crop_norm=crop_norm,
+            drag_box_pane=drag_box_pane,
+            raw_frame_shape=raw_frame.shape[:2],
+            in_moire_mode=True,
+        )
+    else:
+        left = cv2.resize(raw_frame, (left_w, left_h), interpolation=cv2.INTER_AREA)
+        if adjustments is not None:
+            left = adjustments.apply(left)
+        draw_crop_overlay_on_pane(
+            left,
+            crop_norm=crop_norm,
+            drag_box_pane=drag_box_pane,
+            raw_frame_shape=raw_frame.shape[:2],
+            in_moire_mode=False,
+        )
+        inset_w, inset_h = 230, 132
+        inset = render_moire_inset(atlas.last_moire_u8, atlas.last_kps, inset_w, inset_h)
+        left[left_h - inset_h - 10 : left_h - 10, 10 : 10 + inset_w] = inset
+        cv2.rectangle(left, (10, left_h - inset_h - 10), (10 + inset_w, left_h - 10), (220, 180, 90), 1)
+        label(left, "a: SIGH MOIRE (CROPPED)", (16, left_h - inset_h + 8), (255, 220, 130), 0.42)
+
+    right = atlas.tiles.preview(right_w, right_h, atlas.pose, atlas.size, atlas.keyframes,
+                                adjustments=adjustments, zoom=view_zoom)
+
+    if show_sr_loupe and atlas.pose is not None:
+        loupe_w, loupe_h = 340, 145
+        loupe = render_sr_comparison_loupe(cropped_frame, atlas, loupe_w, loupe_h)
+        if adjustments is not None and adjustments.active:
+            loupe = adjustments.apply(loupe)
+        right[right_h - loupe_h - 10 : right_h - 10, right_w - loupe_w - 10 : right_w - 10] = loupe
+        cv2.rectangle(
+            right,
+            (right_w - loupe_w - 10, right_h - loupe_h - 10),
+            (right_w - 10, right_h - 10),
+            (100, 235, 160),
+            1,
+        )
+
+    canvas = np.full((650, 1520, 3), (24, 26, 30), np.uint8)
+    canvas[LEFT_Y0:LEFT_Y1, :left_w] = left
+    canvas[LEFT_Y0:LEFT_Y1, left_w:] = right
+    cv2.rectangle(canvas, (left_w - 2, 0), (left_w + 1, LEFT_Y1), (70, 75, 85), -1)
+
+    crop_status = "CROP ON (X clear)" if crop_norm is not None else "Drag box to crop VHS date"
+    src_title = f"INPUT + MOIRE (M toggle | {crop_status})"
+    label(canvas, src_title, (12, 28), (80, 220, 150), 0.53)
+    label(
+        canvas,
+        f"c: {atlas.tiles.sr_scale:.1f}x SUPER-RES ATLAS [Mode: {atlas.mode}] | View {view_zoom:.1f}x (+/- or wheel)",
+        (left_w + 12, 28),
+        (80, 220, 150),
+        0.52,
+    )
+
+    status = "PAUSED" if paused else ("SUPER-RES TRACKING" if atlas.lost == 0 else "SEARCHING")
+    label(
+        canvas,
+        f"{status} | stitched: {atlas.added} | IBP passes: {atlas.tiles.sr_updates} | tiles: {len(atlas.tiles.tiles)} | anchors: {len(atlas.keyframes)}",
+        (14, 504),
+        (210, 220, 235),
+        0.49,
+    )
+    label(canvas, atlas.last_status[:115], (14, 526), (115, 195, 240), 0.48)
+    if message:
+        label(canvas, message[:95], (left_w + 12, 504), (115, 245, 140), 0.50)
+
+    label(
+        canvas,
+        f"{fps:.1f} fps | W mode | +/- view | G ghost guard | U SR | B IBP | S save | R reset",
+        (left_w + 12, 526),
+        (190, 196, 205),
+        0.38,
+    )
+
+    label(canvas, "Drag Graphical Frequency Filter (Low -> High Freq)  [1-4 Presets]:", (EQ_X0, 554), (210, 215, 225), 0.44)
+    draw_eq_widget(canvas, atlas.eq)
+
+    if video_info is not None:
+        vname, idx, total = video_info
+        label(canvas, f"Video: {vname[:58]}  (frame {idx + 1}/{total})", (TL_X0, 568), (210, 215, 225), 0.45)
+        cv2.rectangle(canvas, (TL_X0, TL_Y0), (TL_X1, TL_Y1), (58, 63, 70), -1)
+        ratio = idx / max(1, total - 1)
+        end_x = int(round(TL_X0 + ratio * (TL_X1 - TL_X0)))
+        cv2.rectangle(canvas, (TL_X0, TL_Y0), (end_x, TL_Y1), (78, 175, 125), -1)
+        cv2.circle(canvas, (end_x, (TL_Y0 + TL_Y1) // 2), 8, (130, 240, 175), -1, cv2.LINE_AA)
+        label(canvas, "Drag timeline to scrub | , / . step frame | J / K -/+ 5s | SPACE resume", (TL_X0, 632), (180, 186, 198), 0.40)
+    else:
+        label(
+            canvas,
+            f"Rigidity Mode: {atlas.mode} (Press W to toggle similarity/euclidean/affine/homography)",
+            (TL_X0, 585),
+            (130, 235, 175),
+            0.44,
+        )
+        label(
+            canvas,
+            "Similarity handles zoom. Homography fits a plane; no single model corrects 3-D parallax.",
+            (TL_X0, 612),
+            (175, 185, 200),
+            0.42,
+        )
+
+    return canvas
+
+
+def choose_video() -> Path | None:
+    try:
+        from tkinter import Tk, filedialog
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            chosen = filedialog.askopenfilename(
+                parent=root,
+                title="Open video for SweepAtlasSigh Super-Resolution",
+                filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"), ("All files", "*.*")],
+            )
+        finally:
+            root.destroy()
+        return Path(chosen) if chosen else None
+    except Exception as exc:
+        print(f"Video file dialog unavailable: {exc}", file=sys.stderr)
+        return None
+
+
+def parse_crop_arg(val: str | None) -> tuple[float, float, float, float] | None:
+    if not val:
+        return None
+    parts = [float(p.strip()) for p in val.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("--crop requires 4 comma-separated floats: x,y,w,h in [0..1]")
+    x, y, w, h = parts
+    return (
+        float(np.clip(x, 0.0, 0.95)),
+        float(np.clip(y, 0.0, 0.95)),
+        float(np.clip(x + w, 0.05, 1.0)),
+        float(np.clip(y + h, 0.05, 1.0)),
+    )
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="SweepAtlasSigh: Super-Resolution Moire-aligned webcam/video stitcher")
+    ap.add_argument("--video", type=Path, default=None, help="Open a video file instead of webcam")
+    ap.add_argument("--camera", type=int, default=0, help="Webcam index")
+    ap.add_argument("--width", type=int, default=960, help="Camera width")
+    ap.add_argument("--height", type=int, default=540, help="Camera height")
+    ap.add_argument("--crop", type=parse_crop_arg, default=None, help="Initial normalized crop x,y,w,h in 0..1")
+    ap.add_argument("--process-hz", type=float, default=8.0, help="Stitching frequency (Hz)")
+    ap.add_argument("--mode", choices=["euclidean", "similarity", "affine", "homography"], default="similarity",
+                    help="Alignment rigidity mode (default: similarity - prevents shear/zoom distortion)")
+    ap.add_argument("--moire-width", type=int, default=320, help="Working width for Sigh FFT Moire filter")
+    ap.add_argument("--min-inliers", type=int, default=10)
+    ap.add_argument("--parallax-guard", action="store_true",
+                    help="Conservative photo-disagreement veto for merging (does not model 3D)")
+    ap.add_argument("--zoom-limit", type=float, default=1.55,
+                    help="Maximum relative scale per keyframe alignment (1.01 to 2.5)")
+    ap.add_argument("--no-rgb-features", action="store_true",
+                    help="Disable zoom-tolerant RGB ORB backup, for A/B testing")
+    ap.add_argument("--super-res", type=float, default=2.0, help="Super-resolution scale factor (1.0 to 3.0)")
+    ap.add_argument("--ibp-gain", type=float, default=0.55, help="Iterative Back-Projection residual gain (0.0 to 1.2)")
+    ap.add_argument("--tile-size", type=int, default=512)
+    ap.add_argument("--max-tiles", type=int, default=1600)
+    ap.add_argument("--max-export-mp", type=float, default=120.0)
+    ap.add_argument("--out", type=Path, default=Path("sweepatlas_output"))
+    ap.add_argument("--no-autosave", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    return ap.parse_args(argv)
+
+
+def run_app(args) -> int:
+    window = "SweepAtlasSigh  |  Sigh Moire Alignment + Super-Resolution Drizzle/IBP"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window, 1520, 650)
+
+    adjustments = ImageAdjustments()
+    cv2.createTrackbar("Contrast %", window, adjustments.contrast, MAX_CONTRAST, lambda _: None)
+    cv2.createTrackbar("Sharpness %", window, adjustments.sharpness, MAX_SHARPNESS, lambda _: None)
+
+    video_path: Path | None = args.video
+    cap = None
+    is_video = False
+    total_frames = 0
+    source_fps = 30.0
+    video_index = 0
+
+    def open_source(vpath: Path | None):
+        nonlocal cap, is_video, total_frames, source_fps, video_index, video_path
+        if cap is not None:
+            cap.release()
+        if vpath is not None:
+            vpath = Path(vpath).expanduser()
+            cap = cv2.VideoCapture(str(vpath))
+            if not cap.isOpened():
+                raise OSError(f"Could not open video: {vpath}")
+            is_video = True
+            video_path = vpath
+            source_fps = float(cap.get(cv2.CAP_PROP_FPS))
+            if not np.isfinite(source_fps) or source_fps < 1:
+                source_fps = 30.0
+            total_frames = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            video_index = 0
+        else:
+            cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
+            if not cap.isOpened() and sys.platform == "win32":
+                cap.release()
+                cap = cv2.VideoCapture(args.camera)
+            if not cap.isOpened():
+                raise OSError(f"Cannot open camera {args.camera}")
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            is_video = False
+            video_path = None
+            source_fps = 30.0
+            total_frames = 0
+
+    try:
+        open_source(video_path)
+    except OSError as exc:
+        print(exc, file=sys.stderr)
+        cv2.destroyAllWindows()
+        return 2
+
+    sr_scale = float(np.clip(args.super_res, 1.0, 3.0))
+    ibp_gain = float(np.clip(args.ibp_gain, 0.0, 1.2))
+    alignment_mode = args.mode
+
+    atlas = SweepAtlasSigh(
+        alignment_mode,
+        args.moire_width,
+        args.min_inliers,
+        args.tile_size,
+        args.max_tiles,
+        sr_scale=sr_scale,
+        ibp_gain=ibp_gain,
+        parallax_guard=args.parallax_guard,
+        zoom_limit=args.zoom_limit,
+        rgb_features=not args.no_rgb_features,
+    )
+
+    paused = False
+    show_moire_main = False
+    show_sr_loupe = True
+    view_zoom = 1.0
+    relocalize = False
+    dragging_eq = False
+    scrubbing_tl = False
+    dragging_crop = False
+    crop_start_pt: tuple[int, int] | None = None
+    drag_box_pane: tuple[int, int, int, int] | None = None
+    crop_norm: tuple[float, float, float, float] | None = args.crop
+    pending_seek: int | None = None
+    last_frame: np.ndarray | None = None
+    last_process = 0.0
+    last_overlay = 0.0
+    next_video_frame_at = time.monotonic()
+    last_processed_vframe = -1
+    saved_once = False
+    message = f"Zoom/Movement aware mode [{alignment_mode}] active. Press W to cycle modes."
+    message_until = time.monotonic() + 9.0
+
+    def reset_atlas_keep_eq(status_msg: str):
+        nonlocal atlas, last_processed_vframe, saved_once, message, message_until
+        cur_gains = atlas.eq.gains.copy()
+        args.parallax_guard = atlas.tiles.parallax_guard
+        atlas = SweepAtlasSigh(
+            alignment_mode,
+            args.moire_width,
+            args.min_inliers,
+            args.tile_size,
+            args.max_tiles,
+            predictor=atlas.predictor,
+            sr_scale=sr_scale,
+            ibp_gain=ibp_gain,
+            parallax_guard=args.parallax_guard,
+            zoom_limit=args.zoom_limit,
+            rgb_features=not args.no_rgb_features,
+        )
+        atlas.eq.set_gains(cur_gains)
+        if last_frame is not None:
+            cropped_now, _ = apply_normalized_crop(last_frame, crop_norm)
+            u8, _, kps, _ = atlas.eq.transform(cropped_now)
+            atlas.last_moire_u8 = u8
+            atlas.last_kps = kps
+        last_processed_vframe = -1
+        saved_once = False
+        message, message_until = status_msg, time.monotonic() + 5.0
+
+    def update_eq_at(mx: int, my: int):
+        band = int((mx - EQ_X0) / ((EQ_X1 - EQ_X0) / atlas.eq.num_bands))
+        gain = 1.0 - (my - EQ_Y0) / max(1, (EQ_Y1 - EQ_Y0))
+        atlas.eq.update_band_from_drag(band, gain)
+        if last_frame is not None:
+            cropped_now, _ = apply_normalized_crop(last_frame, crop_norm)
+            u8, _, kps, _ = atlas.eq.transform(cropped_now)
+            atlas.last_moire_u8 = u8
+            atlas.last_kps = kps
+
+    def mouse_cb(event, x, y, flags, param):
+        nonlocal dragging_eq, scrubbing_tl, dragging_crop, crop_start_pt, drag_box_pane, crop_norm, pending_seek, paused, view_zoom
+        if event == cv2.EVENT_MOUSEWHEEL and x >= LEFT_X1 and LEFT_Y0 <= y < LEFT_Y1:
+            view_zoom = float(np.clip(view_zoom * (1.25 if flags > 0 else 0.8), 1.0, 12.0))
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if LEFT_X0 <= x < LEFT_X1 and LEFT_Y0 <= y < LEFT_Y1:
+                dragging_crop = True
+                px, py = x - LEFT_X0, y - LEFT_Y0
+                crop_start_pt = (px, py)
+                drag_box_pane = (px, py, px, py)
+            elif EQ_X0 <= x <= EQ_X1 and EQ_Y0 - 6 <= y <= EQ_Y1 + 6:
+                dragging_eq = True
+                update_eq_at(x, y)
+            elif is_video and TL_X0 <= x <= TL_X1 and TL_Y0 - 10 <= y <= TL_Y1 + 10:
+                scrubbing_tl = True
+                paused = True
+                alpha = np.clip((x - TL_X0) / max(1, TL_X1 - TL_X0), 0.0, 1.0)
+                pending_seek = int(round(alpha * max(0, total_frames - 1)))
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            if LEFT_X0 <= x < LEFT_X1 and LEFT_Y0 <= y < LEFT_Y1 and crop_norm is not None:
+                crop_norm = None
+                drag_box_pane = None
+                reset_atlas_keep_eq("Cleared input crop (full frame active); reset SR Atlas.")
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if dragging_crop and crop_start_pt is not None:
+                px = int(np.clip(x - LEFT_X0, 0, LEFT_W - 1))
+                py = int(np.clip(y - LEFT_Y0, 0, LEFT_H - 1))
+                drag_box_pane = (crop_start_pt[0], crop_start_pt[1], px, py)
+            elif dragging_eq:
+                update_eq_at(x, y)
+            elif scrubbing_tl and is_video:
+                alpha = np.clip((x - TL_X0) / max(1, TL_X1 - TL_X0), 0.0, 1.0)
+                pending_seek = int(round(alpha * max(0, total_frames - 1)))
+        elif event == cv2.EVENT_LBUTTONUP:
+            if dragging_crop and drag_box_pane is not None:
+                x0, y0, x1, y1 = drag_box_pane
+                dragging_crop = False
+                drag_box_pane = None
+                crop_start_pt = None
+                if abs(x1 - x0) >= 24 and abs(y1 - y0) >= 24:
+                    rx0 = float(np.clip(min(x0, x1) / LEFT_W, 0.0, 1.0))
+                    ry0 = float(np.clip(min(y0, y1) / LEFT_H, 0.0, 1.0))
+                    rx1 = float(np.clip(max(x0, x1) / LEFT_W, 0.0, 1.0))
+                    ry1 = float(np.clip(max(y0, y1) / LEFT_H, 0.0, 1.0))
+                    if show_moire_main and crop_norm is not None:
+                        ox0, oy0, ox1, oy1 = crop_norm
+                        ow, oh = ox1 - ox0, oy1 - oy0
+                        crop_norm = (ox0 + rx0 * ow, oy0 + ry0 * oh, ox0 + rx1 * ow, oy0 + ry1 * oh)
+                    else:
+                        crop_norm = (rx0, ry0, rx1, ry1)
+                    reset_atlas_keep_eq("Applied new input crop box and reset SR Atlas (press X or Right-Click to clear)")
+            dragging_eq = False
+            scrubbing_tl = False
+
+    cv2.setMouseCallback(window, mouse_cb)
+
+    def seek_video(target_idx: int):
+        nonlocal last_frame, video_index, paused, relocalize, last_processed_vframe, message, message_until
+        target_idx = max(0, min(total_frames - 1, int(target_idx)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+        ok, frm = cap.read()
+        if ok and frm is not None:
+            last_frame = frm
+            video_index = target_idx
+            cropped_frm, _ = apply_normalized_crop(frm, crop_norm)
+            u8, _, kps, _ = atlas.eq.transform(cropped_frm)
+            atlas.last_moire_u8 = u8
+            atlas.last_kps = kps
+            paused = True
+            relocalize = True
+            last_processed_vframe = -1
+            message = "Scrub preview. Press SPACE to stitch or R for fresh atlas."
+            message_until = time.monotonic() + 5.0
+
+    def save_atlas():
+        nonlocal saved_once, message, message_until
+        if atlas.tiles.bounds is None:
+            message, message_until = "No mosaic to save yet", time.monotonic() + 4.0
+            return
+        stem = video_path.stem if video_path is not None else "Webcam"
+        filename = args.out / f"SweepAtlasSigh_SR{atlas.tiles.sr_scale:.0f}x_{stem}_{datetime.now():%Y%m%d_%H%M%S}.png"
+        try:
+            adjustments.contrast = cv2.getTrackbarPos("Contrast %", window)
+            adjustments.sharpness = cv2.getTrackbarPos("Sharpness %", window)
+            w, h, factor = atlas.tiles.save(filename, args.max_export_mp, adjustments=adjustments)
+            print(f"SAVED {filename.resolve()} ({w}x{h}, scale {factor:.3f})", flush=True)
+            message, message_until = f"Saved {atlas.tiles.sr_scale:.1f}x Super-Res {filename.name} ({w}x{h})", time.monotonic() + 7.0
+            saved_once = True
+        except Exception as exc:
+            message, message_until = f"Save failed: {exc}", time.monotonic() + 6.0
+
+    preset_names = list(SighMoireEQ.PRESETS.keys())
+    fps_counter = 0
+    fps_timer = time.monotonic()
+    measured_fps = 0.0
+
+    try:
+        while True:
+            now = time.monotonic()
+
+            if is_video:
+                if pending_seek is not None:
+                    t = pending_seek
+                    pending_seek = None
+                    seek_video(t)
+                elif not paused and not dragging_crop and now >= next_video_frame_at:
+                    ok, frm = cap.read()
+                    if ok and frm is not None:
+                        last_frame = frm
+                        pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+                        video_index = int(round(pos)) - 1 if np.isfinite(pos) and pos >= 1 else min(video_index + 1, total_frames - 1)
+                        next_video_frame_at = now + 1.0 / source_fps
+                        stride = max(1, round(source_fps / args.process_hz))
+                        if last_processed_vframe < 0 or (video_index - last_processed_vframe) >= stride or relocalize:
+                            cropped_frm, _ = apply_normalized_crop(last_frame, crop_norm)
+                            atlas.process(cropped_frm, relocalize=relocalize)
+                            last_processed_vframe = video_index
+                            relocalize = False
+                    else:
+                        paused = True
+                        message, message_until = "End of video reached; scrub back or press S to save", now + 6.0
+                elif last_frame is None:
+                    seek_video(0)
+                    paused = False
+            else:
+                ok, frm = cap.read()
+                if ok and frm is not None:
+                    last_frame = frm
+                    fps_counter += 1
+                    if now - fps_timer >= 1.0:
+                        measured_fps = fps_counter / (now - fps_timer)
+                        fps_counter, fps_timer = 0, now
+                    if not paused and not dragging_crop and (now - last_process) >= (1.0 / args.process_hz):
+                        cropped_frm, _ = apply_normalized_crop(last_frame, crop_norm)
+                        atlas.process(cropped_frm, relocalize=relocalize)
+                        relocalize = False
+                        last_process = now
+                elif last_frame is None:
+                    print("Camera returned no frame.", file=sys.stderr)
+                    return 2
+
+            if last_frame is not None and (now - last_overlay) >= 0.05:
+                adjustments.contrast = cv2.getTrackbarPos("Contrast %", window)
+                adjustments.sharpness = cv2.getTrackbarPos("Sharpness %", window)
+                vis_msg = message if now < message_until else ""
+                vinfo = (video_path.name, video_index, total_frames) if is_video and video_path else None
+                disp_fps = source_fps if is_video else measured_fps
+                cropped_frm, _ = apply_normalized_crop(last_frame, crop_norm)
+                ui = build_ui_frame(
+                    last_frame,
+                    cropped_frm,
+                    atlas,
+                    paused,
+                    disp_fps,
+                    vis_msg,
+                    adjustments=adjustments,
+                    show_moire_main=show_moire_main,
+                    show_sr_loupe=show_sr_loupe,
+                    view_zoom=view_zoom,
+                    video_info=vinfo,
+                    crop_norm=crop_norm,
+                    drag_box_pane=drag_box_pane,
+                )
+                cv2.imshow(window, ui)
+                last_overlay = now
+
+            key = cv2.waitKeyEx(10)
+            if key in (ord("q"), ord("Q"), 27):
+                if not args.no_autosave and not saved_once and atlas.tiles.bounds is not None:
+                    save_atlas()
+                break
+            elif key in (ord("s"), ord("S")):
+                save_atlas()
+            elif key in (ord("+"), ord("="), 171):
+                view_zoom = float(min(12., view_zoom * 1.25))
+            elif key in (ord("-"), ord("_"), 173):
+                view_zoom = float(max(1., view_zoom / 1.25))
+            elif key == 32:
+                paused = not paused
+                next_video_frame_at = time.monotonic()
+            elif key in (ord("x"), ord("X")):
+                if crop_norm is not None:
+                    crop_norm = None
+                    drag_box_pane = None
+                    reset_atlas_keep_eq("Cleared input crop (full frame active); reset SR Atlas.")
+                else:
+                    message, message_until = "No active crop to clear", now + 3.5
+            elif key in (ord("w"), ord("W")):
+                # Cycle rigidity modes: similarity -> euclidean -> affine -> homography
+                modes = ["similarity", "euclidean", "affine", "homography"]
+                idx = (modes.index(alignment_mode) + 1) % len(modes)
+                alignment_mode = modes[idx]
+                reset_atlas_keep_eq(f"Switched Rigidity Mode to: {alignment_mode.upper()} (fresh atlas)")
+            elif key in (ord("m"), ord("M")):
+                show_moire_main = not show_moire_main
+                message, message_until = f"Main view: {'Sigh Moire Pattern' if show_moire_main else 'Camera RGB + Crop Box + Moire Inset'}", now + 3.5
+            elif key in (ord("z"), ord("Z")):
+                show_sr_loupe = not show_sr_loupe
+                message, message_until = f"1:1 Super-Res Comparison Loupe: {'ON' if show_sr_loupe else 'OFF'}", now + 3.0
+            elif key in (ord("u"), ord("U")):
+                sr_scale = 2.0 if sr_scale < 1.5 else (3.0 if sr_scale < 2.5 else 1.0)
+                reset_atlas_keep_eq(f"Switched to {sr_scale:.1f}x Super-Resolution Grid (fresh atlas)")
+            elif key in (ord("b"), ord("B")):
+                ibp_gain = 0.0 if ibp_gain > 0.8 else (0.55 if ibp_gain < 0.2 else 0.95)
+                atlas.tiles.ibp_gain = ibp_gain
+                message, message_until = f"IBP High-Freq Residual Gain: {ibp_gain:.2f}", now + 3.5
+            elif key in (ord("r"), ord("R")):
+                reset_atlas_keep_eq(f"Fresh {sr_scale:.1f}x Super-Res atlas initialized")
+            elif key in (ord("c"), ord("C")):
+                adjustments.contrast, adjustments.sharpness = 100, 0
+                cv2.setTrackbarPos("Contrast %", window, 100)
+                cv2.setTrackbarPos("Sharpness %", window, 0)
+                message, message_until = "Reset display contrast & sharpness", now + 3.0
+            elif key in (ord("l"), ord("L")):
+                relocalize = True
+                message, message_until = "Re-anchoring against earlier Moire keyframes...", now + 3.0
+            elif key in (ord("g"), ord("G")):
+                atlas.tiles.parallax_guard = not atlas.tiles.parallax_guard
+                message, message_until = (f"3-D disagreement veto: {atlas.tiles.parallax_guard} "
+                                          f"(only protects future merges)", now + 4.0)
+            elif key in (ord("p"), ord("P")):
+                atlas.predictor = not atlas.predictor
+                message, message_until = f"Motion predictor: {atlas.predictor}", now + 3.0
+            elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
+                idx = key - ord("1")
+                pname = preset_names[idx]
+                atlas.eq.set_gains(SighMoireEQ.PRESETS[pname])
+                if last_frame is not None:
+                    cropped_now, _ = apply_normalized_crop(last_frame, crop_norm)
+                    u8, _, kps, _ = atlas.eq.transform(cropped_now)
+                    atlas.last_moire_u8 = u8
+                    atlas.last_kps = kps
+                message, message_until = f"EQ Preset {idx + 1}: {pname}", now + 4.0
+            elif key in (ord("o"), ord("O")):
+                chosen = choose_video()
+                if chosen is not None:
+                    try:
+                        open_source(chosen)
+                        last_frame = None
+                        paused = False
+                        reset_atlas_keep_eq(f"Loaded video: {chosen.name} ({sr_scale:.1f}x SR)")
+                    except OSError as exc:
+                        message, message_until = str(exc), now + 5.0
+            elif is_video and key in (ord(","), 2424832, 65361):
+                seek_video(video_index - 1)
+            elif is_video and key in (ord("."), 2555904, 65363):
+                seek_video(video_index + 1)
+            elif is_video and key in (ord("j"), ord("J")):
+                seek_video(video_index - int(round(5 * source_fps)))
+            elif is_video and key in (ord("k"), ord("K")):
+                seek_video(video_index + int(round(5 * source_fps)))
+
+            try:
+                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                    if not args.no_autosave and not saved_once and atlas.tiles.bounds is not None:
+                        save_atlas()
+                    break
+            except cv2.error:
+                break
+    finally:
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+    return 0
+
+
+def demo_self_test() -> None:
+    """Self-contained synthetic zoom/pan test; checks *registration*, not true SR gain."""
+    rng = np.random.default_rng(1907)
+    w,h = 640,360
+    base = np.clip(rng.normal(128,36,(h,w,3)),0,255).astype(np.uint8)
+    for i in range(100):
+        x,y = int(rng.integers(16,w-16)),int(rng.integers(16,h-16))
+        color = tuple(int(v) for v in rng.integers(25,240,3))
+        if i%2:
+            cv2.circle(base,(x,y),int(rng.integers(4,16)),color,-1)
+        else:
+            cv2.rectangle(base,(x,y),(min(w-1,x+int(rng.integers(10,50))),
+                                   min(h-1,y+int(rng.integers(6,35)))),color,2)
+    print("Synthetic zoom/pan registration:")
+    for scale in [1.0,1.12,1.28,1.44,1.65]:
+        # Generate a camera view by scaling a world-fixed image about centre.
+        a = np.array([[scale,0,w*.5*(1-scale)+12],
+                      [0,scale,h*.5*(1-scale)-7]],np.float32)
+        frm = cv2.warpAffine(base,a,(w,h),borderMode=cv2.BORDER_REFLECT)
+        algo = SweepAtlasSigh(mode="similarity", sr_scale=1., ibp_gain=0., zoom_limit=1.85)
+        assert algo.process(base)
+        success=algo.process(frm)
+        estimated=algo.last_zoom
+        expected=1/scale
+        ok=success and abs(estimated-expected)<.09
+        print(f"  incoming {scale:.2f}x => expected inverse {expected:.3f}, "
+              f"found {estimated:.3f}; {algo.last_match_method}: {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            raise AssertionError(f"Failed zoom {scale}: {algo.last_status}")
+    print("PASS: synthetic scale registration, not 3D/parallax or SR gain.")
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    if args.self_test:
+        demo_self_test()
+        return 0
+    return run_app(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
