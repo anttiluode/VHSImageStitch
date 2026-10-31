@@ -1,0 +1,55 @@
+name: Windows executable (x64)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-exe.yml"
+      - "SweepAtlasSigh.txt"
+      - "vhsimagestitch_launcher.py"
+      - "build-windows.ps1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build and test portable ZIP + standalone EXE
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.13 (Windows x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+          cache: pip
+
+      - name: Build both packages and run packaged zoom registration tests
+        shell: pwsh
+        run: .\build-windows.ps1
+
+      - name: Upload portable folder ZIP and single-file EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: VHSImageStitch-Windows-x64
+          path: |
+            release/VHSImageStitch-Windows-x64-Portable.zip
+            release/VHSImageStitch-Windows-x64.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic log if build or test fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-log
+          path: |
+            ~/AppData/Local/VHSImageStitch/vhsimagestitch.log
+            build/portable/warn-*.txt
+            build/single/warn-*.txt
+          if-no-files-found: ignore
