@@ -27,7 +27,6 @@ jobs:
         with:
           python-version: '3.13'
           architecture: x64
-          cache: pip
 
       - name: Build both packages and run packaged zoom registration tests
         shell: pwsh
