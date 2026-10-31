@@ -50,7 +50,7 @@ py -3.13 -m venv .venv
 .\build-windows.ps1
 ```
 
-If PowerShell blocks local scripts, use `powershell -ExecutionPolicy Bypass -File .\build-windows.ps1` from the checkout after activating the environment. Output files appear under `release/`. The builder copies `SweepAtlasSigh.txt` to an importable Python module, packages both variants with PyInstaller, and runs the **synthetic zoom/pan registration self-test** against each EXE. This check is not proof of trouble-free performance on real VHS recordings.
+If PowerShell blocks local scripts, use `powershell -ExecutionPolicy Bypass -File .\build-windows.ps1` from the checkout after activating the environment. Output files appear under `release/`. The builder uses `SweepAtlasSigh.py` (or accepts an older `.txt` checkout), packages both variants with PyInstaller, and runs the **synthetic zoom/pan registration self-test** against each EXE. This check is not proof of trouble-free performance on real VHS recordings.
 
 If the windowed EXE fails to open, inspect:
 
