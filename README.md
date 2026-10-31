@@ -29,13 +29,6 @@ git clone https://github.com/anttiluode/VHSImageStitch.git
 cd VHSImageStitch
 python3.13 -m pip install numpy opencv-python
 ```
-
-The Python program is currently stored in the repository as **`SweepAtlasSigh.txt`**. Make a runnable `.py` copy:
-
-```powershell
-Copy-Item SweepAtlasSigh.txt SweepAtlasSigh.py
-```
-
 In Windows installations where `python3.13` is unavailable, use `py -3.13` instead.
 
 ### Start with a video
