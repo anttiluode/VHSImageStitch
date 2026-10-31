@@ -20,6 +20,44 @@
 
 The output uses observed image data. **2× is the atlas sampling grid, not a guarantee of 2× real recovered optical detail.** True improvement depends on multiple differently sampled frames, accurate registration, and the quality of the VHS source.
 
+## Windows EXE — no Python installation required
+
+**Want to run VHSImageStitch on another Windows PC?** Download a compiled Windows x64 build instead of installing Python or pip packages:
+
+1. Open [GitHub Actions — Windows executable (x64)](https://github.com/anttiluode/VHSImageStitch/actions/workflows/windows-exe.yml).
+2. Open a **successful (green)** build run.
+3. Under **Artifacts**, download `VHSImageStitch-Windows-x64` and extract that downloaded ZIP.
+4. Choose one of the two packages inside:
+   - **Recommended:** `VHSImageStitch-Windows-x64-Portable.zip` — extract this second ZIP, open the `VHSImageStitch` folder, and double-click `VHSImageStitch.exe`. **Keep the accompanying `_internal` directory**; the folder is portable, not just the EXE.
+   - **Single file:** `VHSImageStitch-Windows-x64.exe` — one executable that unpacks its libraries when started. It may start more slowly or trigger more antivirus scrutiny.
+5. With the app open, press **`O`** and select a video. Press **`M`** to view/tune the Sigh moiré frequencies; press **`S`** to save the image.
+
+These builds bundle Python, OpenCV and NumPy. No installation, Python, or NVIDIA GPU is required on the destination PC. They target **64-bit Windows 10/11**; older Windows versions and ARM Windows are **not guaranteed**. Video codec support still depends on the included OpenCV/FFmpeg backend, and very large super-resolution atlases can require significant RAM. Builds are **unsigned**, so Windows SmartScreen may display a reputation warning: check the GitHub source/build before deciding to run them.
+
+**Build status:** a downloadable binary only exists after a GitHub Actions run finishes successfully; do not assume the source-code commit itself contains an EXE. Artifacts currently expire after 30 days.
+
+### Build the Windows EXE yourself (developer)
+
+From PowerShell on **Windows** with Python 3.13 installed:
+
+```powershell
+git clone https://github.com/anttiluode/VHSImageStitch.git
+cd VHSImageStitch
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+# The builder uses the current 'python' command; activate the venv first:
+.\.venv\Scripts\Activate.ps1
+.\build-windows.ps1
+```
+
+If PowerShell blocks local scripts, use `powershell -ExecutionPolicy Bypass -File .\build-windows.ps1` from the checkout after activating the environment. Output files appear under `release/`. The builder copies `SweepAtlasSigh.txt` to an importable Python module, packages both variants with PyInstaller, and runs the **synthetic zoom/pan registration self-test** against each EXE. This check is not proof of trouble-free performance on real VHS recordings.
+
+If the windowed EXE fails to open, inspect:
+
+```text
+%LOCALAPPDATA%\VHSImageStitch\vhsimagestitch.log
+```
+
 ## Install (Windows / Python 3.13)
 
 Download or clone this repository:
