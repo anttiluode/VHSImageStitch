@@ -27,6 +27,39 @@ Other handy keys: **1–4** = frequency presets; **+ / −** = zoom the atlas di
 
 **Limits:** slow, overlapping camera sweeps work best. Sideways motion in a 3D room can create double edges because objects at different distances shift differently. A 2× output grid does not guarantee twice the detail of the original VHS recording.
 
+## Run the Python source instead
+
+If you prefer Python, download the [source code](SweepAtlasSigh.py) or clone this repository. You need **Python 3.13** and just two third-party libraries: **NumPy** and **OpenCV**. Tkinter (used for the file picker) is included with standard Windows Python installations.
+
+Open PowerShell in the downloaded project folder and install the libraries:
+
+```powershell
+py -3.13 -m pip install numpy opencv-python
+```
+
+Run the program with its webcam input:
+
+```powershell
+py -3.13 SweepAtlasSigh.py
+```
+
+Or load a saved VHS capture directly:
+
+```powershell
+py -3.13 SweepAtlasSigh.py --video "my_vhs_video.mp4"
+```
+
+You can also start without a filename and press **O** to pick a video. The same **M**, frequency-graph, and **S** controls work in the Python and EXE versions.
+
+To check the alignment test or see more options:
+
+```powershell
+py -3.13 SweepAtlasSigh.py --self-test
+py -3.13 SweepAtlasSigh.py --help
+```
+
+If the Windows Python launcher `py -3.13` is not available, use the command for your installed Python (for example `python3.13` or `python`) instead.
+
 ## Where the EXE comes from
 
 The Windows EXE was **built from the public Python source in this repository**, using [GitHub Actions](https://github.com/anttiluode/VHSImageStitch/actions/workflows/windows-exe.yml) on a Windows x64 runner. The [build script](build-windows.ps1) packages [SweepAtlasSigh.py](SweepAtlasSigh.py) with PyInstaller, NumPy and OpenCV, and runs a synthetic registration self-test. The result was uploaded as a downloadable asset to the [v1.0.0 release](https://github.com/anttiluode/VHSImageStitch/releases/tag/v1.0.0).
