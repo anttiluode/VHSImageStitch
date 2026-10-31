@@ -1,8 +1,10 @@
 # VHSImageStitch
 
-**Turn old VHS videos into wider stitched pictures.** A Windows app that combines Sigh moiré edge matching with a 2× super-resolution atlas. No Python installation or GPU needed.
+**Stitch overlapping frames from VHS recordings or ordinary videos into wider pictures.** A Windows app combining Sigh moiré edge matching with a 2× super-resolution atlas. No Python installation or GPU needed.
 
 ![VHSImageStitch showing moiré edges and the stitched atlas](pic.png)
+
+**[▶ Watch the VHSImageStitch video demonstration on YouTube](https://youtu.be/xhXtOVkcuMQ)** — shows the EXE, Python version, moiré frequency tuning, cropping, and image stitching.
 
 ## Download and run — Windows 10/11 (64-bit)
 
